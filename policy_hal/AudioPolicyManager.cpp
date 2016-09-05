@@ -1151,7 +1151,8 @@ status_t AudioPolicyManagerCustom::startSource(sp<AudioOutputDescriptor> outputD
                 }
             }
         }
-        uint32_t muteWaitMs = setOutputDevice(outputDesc, device, force);
+        uint32_t muteWaitMs;
+        muteWaitMs = setOutputDevice(outputDesc, device, force, 0, NULL, address);
 
         // handle special case for sonification while in call
         if (isInCall()) {
@@ -1160,7 +1161,7 @@ status_t AudioPolicyManagerCustom::startSource(sp<AudioOutputDescriptor> outputD
 
         // apply volume rules for current stream and device if necessary
         checkAndSetVolume(stream,
-                          mStreams.valueFor(stream).getVolumeIndex(device),
+                          mVolumeCurves->getVolumeIndex(stream, device),
                           outputDesc,
                           device);
 
@@ -1288,7 +1289,7 @@ status_t AudioPolicyManagerCustom::checkAndSetVolume(audio_stream_type_t stream,
         float voiceVolume;
         // Force voice volume to max for bluetooth SCO as volume is managed by the headset
         if (stream == AUDIO_STREAM_VOICE_CALL) {
-            voiceVolume = (float)index/(float)mStreams.valueFor(stream).getVolumeIndexMax();
+            voiceVolume = (float)index/(float)mVolumeCurves->getVolumeIndexMax(stream);
         } else {
             voiceVolume = 1.0;
         }
@@ -1614,7 +1615,7 @@ audio_io_handle_t AudioPolicyManagerCustom::getOutputForDevice(
     // skip direct output selection if the request can obviously be attached to a mixed output
     // and not explicitly requested
     if (((flags & (AUDIO_OUTPUT_FLAG_DIRECT|AUDIO_OUTPUT_FLAG_DIRECT_PCM)) == 0) &&
-            audio_is_linear_pcm(format) && samplingRate <= MAX_MIXER_SAMPLING_RATE &&
+            audio_is_linear_pcm(format) && samplingRate <= SAMPLE_RATE_HZ_MAX &&
             audio_channel_count_from_out_mask(channelMask) <= 2) {
         goto non_direct_output;
     }
@@ -1630,7 +1631,7 @@ audio_io_handle_t AudioPolicyManagerCustom::getOutputForDevice(
     // For sake of track offload introduced, we need a rollback for both compress offload
     // and track offload use cases.
     if ((flags & (AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD|AUDIO_OUTPUT_FLAG_DIRECT_PCM)) &&
-                mEffects.isNonOffloadableEffectEnabled()) {
+                !(mEffects.isNonOffloadableEffectEnabled() || mMasterMono)) {
         ALOGD("non offloadable effect is enabled, try with non direct output");
         goto non_direct_output;
     }
@@ -1658,7 +1659,7 @@ audio_io_handle_t AudioPolicyManagerCustom::getOutputForDevice(
                 outputDesc = desc;
                 // reuse direct output if currently open and configured with same parameters
                 if ((samplingRate == outputDesc->mSamplingRate) &&
-                        (format == outputDesc->mFormat) &&
+                        audio_formats_match(format, outputDesc->mFormat) &&
                         (channelMask == outputDesc->mChannelMask)) {
                     outputDesc->mDirectOpenCount++;
                     ALOGV("getOutput() reusing direct output %d", mOutputs.keyAt(i));
@@ -1674,7 +1675,7 @@ audio_io_handle_t AudioPolicyManagerCustom::getOutputForDevice(
         // if the selected profile is offloaded and no offload info was specified,
         // create a default one
         audio_offload_info_t defaultOffloadInfo = AUDIO_INFO_INITIALIZER;
-        if ((profile->mFlags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD) && !offloadInfo) {
+        if ((profile->getFlags() & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD) && !offloadInfo) {
             flags = (audio_output_flags_t)(flags | AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD);
             defaultOffloadInfo.sample_rate = samplingRate;
             defaultOffloadInfo.channel_mask = channelMask;
@@ -1709,7 +1710,7 @@ audio_io_handle_t AudioPolicyManagerCustom::getOutputForDevice(
         // only accept an output with the requested parameters
         if (status != NO_ERROR ||
             (samplingRate != 0 && samplingRate != config.sample_rate) ||
-            (format != AUDIO_FORMAT_DEFAULT && format != config.format) ||
+            (format != AUDIO_FORMAT_DEFAULT && !audio_formats_match(format, config.format)) ||
             (channelMask != 0 && channelMask != config.channel_mask)) {
             ALOGV("getOutput() failed opening direct output: output %d samplingRate %d %d,"
                     "format %d %d, channelMask %04x %04x", output, samplingRate,
@@ -1719,7 +1720,7 @@ audio_io_handle_t AudioPolicyManagerCustom::getOutputForDevice(
                 mpClientInterface->closeOutput(output);
             }
             // fall back to mixer output if possible when the direct output could not be open
-            if (audio_is_linear_pcm(format) && samplingRate <= MAX_MIXER_SAMPLING_RATE) {
+            if (audio_is_linear_pcm(format) && samplingRate <= SAMPLE_RATE_HZ_MAX) {
                 goto non_direct_output;
             }
             return AUDIO_IO_HANDLE_NONE;
@@ -1760,6 +1761,13 @@ audio_io_handle_t AudioPolicyManagerCustom::getOutputForDevice(
     }
 
 non_direct_output:
+    
+    // A request for HW A/V sync cannot fallback to a mixed output because time
+    // stamps are embedded in audio data
+    if ((flags & AUDIO_OUTPUT_FLAG_HW_AV_SYNC) != 0) {
+        return AUDIO_IO_HANDLE_NONE;
+    }
+    
     // ignoring channel mask due to downmix capability in mixer
 
     // open a non direct output
@@ -2063,15 +2071,16 @@ AudioPolicyManagerCustom::AudioPolicyManagerCustom(AudioPolicyClientInterface *c
 {
 
     for (size_t i = 0; i < mHwModules.size(); i++) {
-        ALOGV("Hw module %d", i);
+        ALOGV("Hw module %zu", i);
         for (size_t j = 0; j < mHwModules[i]->mInputProfiles.size(); j++) {
             const sp<IOProfile> inProfile = mHwModules[i]->mInputProfiles[j];
-            ALOGV("\t Input profile ", j);
-            for (size_t k = 0; k  < inProfile->mChannelMasks.size(); k++) {
-                audio_channel_mask_t channelMask =
-                    inProfile->mChannelMasks.itemAt(k);
-                ALOGV("\t\tChannel Mask %x size %d", channelMask,
-                    inProfile->mChannelMasks.size());
+            AudioProfileVector profiles = inProfile->getAudioProfiles();
+            for (size_t k = 0; k < profiles.size(); k++){
+                ChannelsVector channels = profiles[k]->getChannels();
+                for (size_t x = 0; x < channels.size(); x++) {
+                audio_channel_mask_t channelMask = channels[x];
+                ALOGV("\t\tChannel Mask %x size %zu", channelMask,
+                    channels.size());
                 if (AUDIO_CHANNEL_IN_5POINT1 == channelMask) {
                     char ssr_enabled[PROPERTY_VALUE_MAX]={0};
                     if ((property_get("ro.qc.sdk.audio.ssr",
@@ -2083,9 +2092,9 @@ AudioPolicyManagerCustom::AudioPolicyManagerCustom(AudioPolicyClientInterface *c
                             ALOGE("\t\t removing AUDIO_CHANNEL_IN_5POINT1 from"
                                 " input profile as SSR(surround sound record)"
                                 " is not supported on this chipset variant");
-                            inProfile->mChannelMasks.removeItemsAt(k, 1);
-                            ALOGV("\t\t Channel Mask size now %d",
-                                inProfile->mChannelMasks.size());
+                            channels.removeItemsAt(x, 1);
+                            ALOGV("\t\t Channel Mask size now %zu",
+                                channels.size());
                     }
                 }
             }
