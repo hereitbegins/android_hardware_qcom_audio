@@ -116,7 +116,7 @@ status_t AudioPolicyManagerCustom::setDeviceConnectionStateInt(audio_devices_t d
                                                          const char *device_address,
                                                          const char *device_name)
 {
-    ALOGV("setDeviceConnectionStateInt() device: 0x%X, state %d, address %s name %s",
+    ALOGD("setDeviceConnectionStateInt() device: 0x%X, state %d, address %s name %s",
             device, state, device_address, device_name);
 
     // connect/disconnect only 1 device at a time
@@ -307,6 +307,10 @@ status_t AudioPolicyManagerCustom::setDeviceConnectionStateInt(audio_devices_t d
                 setOutputDevice(desc, newDevice, force, 0);
             }
         }
+        
+        if (state == AUDIO_POLICY_DEVICE_STATE_UNAVAILABLE) {
+            cleanUpForDevice(devDesc);
+        }
 
         mpClientInterface->onAudioPortListUpdate();
         return NO_ERROR;
@@ -382,6 +386,10 @@ status_t AudioPolicyManagerCustom::setDeviceConnectionStateInt(audio_devices_t d
         if (mEngine->getPhoneState() == AUDIO_MODE_IN_CALL && hasPrimaryOutput()) {
             audio_devices_t newDevice = getNewOutputDevice(mPrimaryOutput, false /*fromCache*/);
             updateCallRouting(newDevice);
+        }
+        
+        if (state == AUDIO_POLICY_DEVICE_STATE_UNAVAILABLE) {
+            cleanUpForDevice(devDesc);
         }
 
         mpClientInterface->onAudioPortListUpdate();
@@ -572,12 +580,12 @@ audio_devices_t AudioPolicyManagerCustom::getNewOutputDevice(const sp<AudioOutpu
 {
     audio_devices_t device = AUDIO_DEVICE_NONE;
 
-    ssize_t index = mAudioPatches.indexOfKey(outputDesc->mPatchHandle);
+    size_t index = mAudioPatches.indexOfKey(outputDesc->getPatchHandle());
     if (index >= 0) {
         sp<AudioPatch> patchDesc = mAudioPatches.valueAt(index);
         if (patchDesc->mUid != mUidCached) {
             ALOGV("getNewOutputDevice() device %08x forced by patch %d",
-                  outputDesc->device(), outputDesc->mPatchHandle);
+                  outputDesc->device(), outputDesc->getPatchHandle());
             return outputDesc->device();
         }
     }
@@ -635,7 +643,7 @@ audio_devices_t AudioPolicyManagerCustom::getNewOutputDevice(const sp<AudioOutpu
 
 void AudioPolicyManagerCustom::setPhoneState(audio_mode_t state)
 {
-    ALOGV("setPhoneState() state %d", state);
+    ALOGD("setPhoneState() state %d", state);
     // store previous phone state for management of sonification strategy below
     audio_devices_t newDevice = AUDIO_DEVICE_NONE;
     int oldState = mEngine->getPhoneState();
@@ -959,7 +967,7 @@ void AudioPolicyManagerCustom::setPhoneState(audio_mode_t state)
 void AudioPolicyManagerCustom::setForceUse(audio_policy_force_use_t usage,
                                          audio_policy_forced_cfg_t config)
 {
-    ALOGV("setForceUse() usage %d, config %d, mPhoneState %d", usage, config, mEngine->getPhoneState());
+    ALOGD("setForceUse() usage %d, config %d, mPhoneState %d", usage, config, mEngine->getPhoneState());
 
     if (mEngine->setForceUse(usage, config) != NO_ERROR) {
         ALOGW("setForceUse() could not set force cfg %d for usage %d", config, usage);
@@ -997,7 +1005,14 @@ void AudioPolicyManagerCustom::setForceUse(audio_policy_force_use_t usage,
 
     audio_io_handle_t activeInput = mInputs.getActiveInput();
     if (activeInput != 0) {
-        setInputDevice(activeInput, getNewInputDevice(activeInput));
+        sp<AudioInputDescriptor> activeDesc = mInputs.valueFor(activeInput);
+        audio_devices_t newDevice = getNewInputDevice(activeInput);
+        // Force new input selection if the new device can not be reached via current input
+        if (activeDesc->mProfile->getSupportedDevices().types() & (newDevice & ~AUDIO_DEVICE_BIT_IN)) {
+            setInputDevice(activeInput, newDevice);
+        } else {
+            closeInput(activeInput);
+        }
     }
 
 }
@@ -1073,6 +1088,7 @@ status_t AudioPolicyManagerCustom::stopSource(sp<AudioOutputDescriptor> outputDe
 status_t AudioPolicyManagerCustom::startSource(sp<AudioOutputDescriptor> outputDesc,
                                              audio_stream_type_t stream,
                                              audio_devices_t device,
+                                             const char *address,
                                              uint32_t *delayMs)
 {
     // cannot start playback of STREAM_TTS if any other output is being used
@@ -1086,7 +1102,7 @@ status_t AudioPolicyManagerCustom::startSource(sp<AudioOutputDescriptor> outputD
     *delayMs = 0;
     if (stream == AUDIO_STREAM_TTS) {
         ALOGV("\t found BEACON stream");
-        if (mOutputs.isAnyOutputActive(AUDIO_STREAM_TTS /*streamToIgnore*/)) {
+        if (!mTtsOutputAvailable && mOutputs.isAnyOutputActive(AUDIO_STREAM_TTS /*streamToIgnore*/)) {
             return INVALID_OPERATION;
         } else {
             beaconMuteLatency = handleEventForBeacon(STARTING_BEACON);
@@ -1095,6 +1111,9 @@ status_t AudioPolicyManagerCustom::startSource(sp<AudioOutputDescriptor> outputD
         // some playback other than beacon starts
         beaconMuteLatency = handleEventForBeacon(STARTING_OUTPUT);
     }
+    
+    // check active before incrementing usage count
+    bool force = !outputDesc->isActive();
 
     // increment usage count for this stream on the requested output:
     // NOTE that the usage count is the same for duplicated output and hardware output which is
